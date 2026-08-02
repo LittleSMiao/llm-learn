@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.Functional as F
+import torch.nn.functional as F
 import math
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
@@ -89,17 +89,20 @@ class GroupQueryAttention(nn.Module):
         self.key_value_head_num = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.n_rep = self.query_head_num // self.key_value_head_num
+        self.drop_out = config.dropout
 
-        self.q_proj = nn.Linear(self.hidden_size, query_head_num * self.head_dim, bias = Flase)
-        self.k_proj = nn.Linear(self.hidden_size, key_value_head_num * self.head_dim, bias = Flase)
-        self.v_proj = nn.Linear(self.hidden_size, key_value_head_num * self.head_dim, bias = Flase)
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias = Flase)
+        self.q_proj = nn.Linear(self.hidden_size, self.query_head_num * self.head_dim, bias = False)
+        self.k_proj = nn.Linear(self.hidden_size, self.key_value_head_num * self.head_dim, bias = False)
+        self.v_proj = nn.Linear(self.hidden_size, self.key_value_head_num * self.head_dim, bias = False)
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias = False)
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.attn_dropout = nn.Dropout(drop_out)
-        self.resid_dropout = nn.Dropout(drop_out)
+        self.is_causal = True
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
     def repeat(self, x):
@@ -111,7 +114,7 @@ class GroupQueryAttention(nn.Module):
             return x
         return x.unsqueeze(3).expand(batch, seq, head_num, self.n_rep, head_dim).reshape(batch, seq, -1, head_dim)
 
-    def forward(self, x, position_embeddings, past_key_value = None, attention_mask = None, use_cache: bool=false, is_causal: bool = true):
+    def forward(self, x, position_embeddings, past_key_value = None, use_cache: bool=False, attention_mask = None):
         batch, seq, _ = x.size()
         xq = self.q_proj(x).view(batch, seq, self.query_head_num, self.head_dim)
         xk = self.k_proj(x).view(batch, seq, self.key_value_head_num, self.head_dim)
@@ -119,33 +122,33 @@ class GroupQueryAttention(nn.Module):
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
         cos, sin = position_embeddings
-        apply_rotary_pos_emb(xq, xk, cos, sin)
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
         # (2, batch, seq, heddiendim)
         if past_key_value is not None:
             # batch, post_seq + seq, kv_hiddendim
             xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[0], xv], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
         # batch, head_num, seq, head_dim
         xq = xq.transpose(1,2)
         # batch, head_num, post + seq, head_dim
-        xk = repeat(xk).transpose(1, 2)
-        xv = repeat(xv).transpose(1, 2)
+        xk = self.repeat(xk).transpose(1, 2)
+        xv = self.repeat(xv).transpose(1, 2)
         if self.flash and (seq > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.drop_out if self.training else 0.0, is_causal=self.is_causal)
         else:
             # batch, head_num, seq, post_seq + seq
             attention_weight = (xq @ xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if is_causal:
-                attention_weight = attention_weight[:, :, :, -seq:] + torch.full((seq, seq), float("-inf")).triu(1)
+            if self.is_causal:
+                attention_weight = attention_weight[:, :, :, -seq:] + torch.full((seq, seq), float("-inf")).triu(1).to(attention_weight.device)
             # 这里的 attention mask 维度是 batch * seq，是上层应用传入表示那些有效，所以我们需要把score中无效的toekn设置为-1
             if (attention_mask is not None):
                 # batch, seq -> batch, 1, 1, seq 然后利用broad_cast
                 # attention weight 是 batch, head_num, seq, seq
-                attention_weight = attention_weight + attention_mask.unsqueeze(1).unsqueeze(1) * float('-inf')
+                attention_weight = attention_weight + (1 - attention_mask).unsqueeze(1).unsqueeze(1) * float('-inf')
             # batch, head_num, seq, head_dim
-            output = (self.attn_dropout(attention_score) @ xv).transpose(1, 2).view(batch, seq, -1).contingous()
+            output = (self.attn_dropout(attention_weight) @ xv).transpose(1, 2).view(batch, seq, -1).contingous()
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
@@ -156,7 +159,7 @@ class FeedForward(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size)
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size)
-        self.act_fn = ACT2FN[config.act_fn]
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -175,22 +178,22 @@ class MoeFeedForward(nn.Module):
         # batch * seq, expert_num
         expert_logits = torch.softmax(self.gate(x_flat), dim=-1)
         # batch * seq, top_k
-        topk_wegiht, topk_indices = torch.top_k(expert_logits, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
+        topk_wegiht, topk_indices = torch.topk(expert_logits, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
 
-        if (config.norm_topk_prob):
+        if (self.config.norm_topk_prob):
             topk_wegiht = topk_wegiht / (torch.sum(topk_wegiht, dim=-1, keepdim=True) + 1e-20)
 
         y = torch.zeros_like(x_flat)
 
         for (expert_idx, expert) in enumerate(self.experts):
-            seq_mask = topk_indices == exprt_idx
+            seq_mask = topk_indices == expert_idx
             if torch.any(seq_mask):
                 # 这里的 any 调用会降低一个维度，nonzero会升高一个维度，flatten会重新拍平
                 selected_seq = torch.any(seq_mask, dim = -1).nonzero().flatten()
                 # 这里的布尔索引会选中所有为 True 的元素，结果压平为一维
                 # selected_num, 1
                 selected_weight = topk_wegiht[seq_mask].unsqueeze(1)
-                y._index_add(0, selected_seq, (expert(x_flat[selected_seq]) * weight).to(y.dtype))
+                y.index_add_(0, selected_seq, (expert(x_flat[selected_seq]) * selected_weight).to(y.dtype))
             elif self.training:
                 # 这个地方时防止空载报错
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
@@ -209,3 +212,80 @@ class MoeFeedForward(nn.Module):
             self.aux_loss = expert_logits.new_zeros(1).squeeze()
 
         return y.view(batch, seq, -1)
+
+class LLMBlock(nn.Module):
+    def __init__(self, config: MyGptConfig):
+        super().__init__()
+        self.pre_attention_layernorm = RMSNorm(config.hidden_size)
+        self.pre_forward_layernorm = RMSNorm(config.hidden_size)
+        
+        self.attn = GroupQueryAttention(config)
+        self.feedForward = MoeFeedForward(config) if config.use_moe else FeedForward(config)
+
+    def forward(self, x, position_embeddings, past_key_value = None, use_cache: bool=False, attention_mask = None):
+        residual = x
+        x, presnt_key_value = self.attn(
+            self.pre_attention_layernorm(x),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask
+        )
+        x += residual
+
+        x += self.feedForward(self.pre_forward_layernorm(x))
+
+        return x, presnt_key_value
+
+class MyGpt(nn.Module):
+    def __init__(self, config: MyGptConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.layer_num = config.num_hidden_layers
+        self.hidden_size = config.hidden_size
+        self.embedding = nn.Embedding(self.vocab_size, self.hidden_size)
+        self.drop_out = nn.Dropout(config.dropout)
+        self.norm = RMSNorm(config.hidden_size)
+        self.block_layers = nn.ModuleList([LLMBlock(config) for _ in range(self.layer_num)])
+        
+        freqs_cos, freqs_sin = precompute_freqs_cis(config.head_dim, config.max_position_embeddings, config.rope_theta, config.rope_scaling)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, x, position_embeddings, past_key_values = None, use_cache: bool=False, attention_mask = None):
+        # 这个地方用来判断是否是huging face的past_key_value对象
+        batch, seq = x.shape
+        if hasattr(past_key_values, 'layers'): past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.block_layers)
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        hidden_states = self.drop_out(self.embedding(x))
+        if self.freqs_cos[0, 0] == 0:
+            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
+            self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+        position_embedding = (freqs_cos[start_pos : start_pos + seq], freqs_sin[start_pos : start_pos + seq])
+
+        present_key_vlaues = []
+        for block, past_key_value in zip(self.block_layers, past_key_values):
+            hidden_states, present_key_value = block(
+                hidden_states, position_embedding, past_key_value, use_cache, attention_mask
+            )
+            
+            present_key_vlaues.append(present_key_value)
+
+        hidden_states = self.norm(hidden_states)
+        aux_loss = sum([l.feedForward.aux_loss for l in self.block_layers if isinstance(l.feedForward, MoeFeedForward)], hidden_states.new_zeros(1).squeeze())
+        return hidden_states, present_key_vlaues, aux_loss
+
+class MyGptForCausalLLM(PreTrainedModel, GenerationMixin):
+    config_class = MyGptConfig
+    _tied_weights_keys = {"lm_head.weight" : "model.embedding.weight"}
+    def __init__(self, config: MyGptConfig=None):
+        self.config = config or MyGptConfig()
+        super().__init__(self.config)
+        self.model = MyGpt(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size)
+        if self.tie_word_embeddings:
+            self.model.embedding.weight = self.lm_head.weight
+        post_init()
+        
