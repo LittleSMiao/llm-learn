@@ -20,8 +20,8 @@ def get_model_params(model, config):
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
     n_shared = getattr(config, 'n_shared_experts', 0)
-    expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n) / 1e6
-    shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
+    expert = sum(p.numel() for n, p in model.named_parameters() if 'feedForward.experts.0.' in n) / 1e6
+    shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'feedForward.shared_experts.0.' in n) / 1e6
     base = total - (expert * n_routed) - (shared_expert * n_shared)
     active = base + (expert * n_active) + (shared_expert * n_shared)
     if active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
@@ -117,6 +117,10 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+    if not os.path.isdir(tokenizer_path) or not any(
+        f.endswith(('tokenizer_config.json', 'tokenizer.json', 'vocab.json', 'merges.txt')) for f in os.listdir(tokenizer_path)
+    ):
+        Logger(f'提示: {tokenizer_path} 下未检测到 tokenizer 配置文件，AutoTokenizer.from_pretrained 可能失败，请确认 tokenizer 已放置在该目录')
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MyGptForCausalLLM(lm_config)
 
@@ -153,7 +157,10 @@ class SkipBatchSampler(Sampler):
             yield batch
 
     def __len__(self):
-        total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
+        # DistributedSampler 的 len() 返回的是全集大小，但实际只产出本 rank 的样本数
+        # 其 num_samples 属性才是本 rank 实际产出的样本数，取它来计算 batch 数
+        src_len = self.sampler.num_samples if hasattr(self.sampler, 'num_samples') else len(self.sampler)
+        total_batches = (src_len + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
 
 

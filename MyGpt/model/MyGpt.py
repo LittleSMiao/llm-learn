@@ -138,17 +138,21 @@ class GroupQueryAttention(nn.Module):
         if self.flash and (seq > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.drop_out if self.training else 0.0, is_causal=self.is_causal)
         else:
-            # batch, head_num, seq, post_seq + seq
+            # batch, head_num, seq, past_len + seq
             attention_weight = (xq @ xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+            kv_seq_len = attention_weight.shape[-1]
             if self.is_causal:
-                attention_weight = attention_weight[:, :, :, -seq:] + torch.full((seq, seq), float("-inf")).triu(1).to(attention_weight.device)
-            # 这里的 attention mask 维度是 batch * seq，是上层应用传入表示那些有效，所以我们需要把score中无效的toekn设置为-1
+                # 因果 mask 只作用于右侧新 token 的 key 列，左侧 past 列是历史 key，全部可见
+                causal_mask = torch.zeros(seq, kv_seq_len, device=attention_weight.device, dtype=attention_weight.dtype)
+                causal_mask[:, kv_seq_len - seq:] = torch.full((seq, seq), float("-inf"), device=attention_weight.device, dtype=attention_weight.dtype).triu(1)
+                attention_weight = attention_weight + causal_mask.unsqueeze(0).unsqueeze(0)
+            # 这里的 attention mask 维度是 batch * seq，是上层应用传入表示哪些有效，所以我们需要把 score 中无效的 token 设置为 -inf
             if (attention_mask is not None):
                 # batch, seq -> batch, 1, 1, seq 然后利用broad_cast
                 # attention weight 是 batch, head_num, seq, seq
                 attention_weight = attention_weight + (1 - attention_mask).unsqueeze(1).unsqueeze(1) * float('-inf')
             # batch, head_num, seq, head_dim
-            output = (self.attn_dropout(attention_weight) @ xv).transpose(1, 2).view(batch, seq, -1).contingous()
+            output = (self.attn_dropout(attention_weight) @ xv).transpose(1, 2).contiguous().view(batch, seq, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
@@ -261,10 +265,8 @@ class MyGpt(nn.Module):
         # past_key_values 的维度是 layer, k/v, batch, seq, himddendim
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         hidden_states = self.drop_out(self.embedding(x))
-        if self.freqs_cos[0, 0] == 0:
-            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
-            self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
-        position_embedding = (freqs_cos[start_pos : start_pos + seq], freqs_sin[start_pos : start_pos + seq])
+        # freqs_cos/sin 是注册的 buffer，会随模型 .to(device) 自动迁移，直接切片即可
+        position_embedding = (self.freqs_cos[start_pos : start_pos + seq], self.freqs_sin[start_pos : start_pos + seq])
 
         present_key_vlaues = []
         for block, past_key_value in zip(self.block_layers, past_key_values):
@@ -290,23 +292,27 @@ class MyGptForCausalLLM(PreTrainedModel, GenerationMixin):
             self.model.embedding.weight = self.lm_head.weight
         self.post_init()
         
-    def forward(self, x, past_key_values = None, use_cache: bool=False, attention_mask = None, logits_to_keep = 0, lables = None):
+    def forward(self, x, past_key_values = None, use_cache: bool=False, attention_mask = None, logits_to_keep = 0, labels = None):
         hidden_states, past_key_values, aux_loss = self.model(x, past_key_values, use_cache, attention_mask)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         # batch, seq, vocab_size
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
-        if lables != None
-            x, y = logits[..., :-1, :].contingous(), lables[..., 1:].contingous()
+        if labels is not None:
+            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss = loss, aux_loss = aux_loss, logits = logits, past_key_values = past_key_values, hidden_states = hidden_states)
 
     @torch.inference_mode()
     def generate(self, inputs = None, attention_mask = None, max_new_tokens = 8192, eos_token_id = 2, temperature = 0.85, top_p=0.85, top_k=50, num_return_seqs = 1, use_cache: bool=True, do_sample=True, repetition_penalty = 1.0, **kwargs):
         # 第0维重复num_return_seqs次，第一维重复1次
-        input_ids = kwargs.pop("input_idx", inputs).repeat(num_return_seqs, 1)
-        attention_mask = attention_mask.repeat(num_return_seqs, 1) if attention_mask != None else attention_mask
-        past_key_values = kwargs("past_key_values", None)
+        input_ids = kwargs.pop("input_idx", inputs)
+        if input_ids is None:
+            raise ValueError("generate() 需要传入 inputs（或 kwargs 中的 input_idx）")
+        input_ids = input_ids.repeat(num_return_seqs, 1)
+        attention_mask = attention_mask.repeat(num_return_seqs, 1) if attention_mask is not None else attention_mask
+        past_key_values = kwargs.get("past_key_values", None)
+        streamer = kwargs.pop("streamer", None)
         finished = torch.zeros(input_ids.shape[0], dtype = torch.bool, device=input_ids.device)
         for _ in range(max_new_tokens):
             # 这里在第0步可以处理，如果初始输入没有kvcache的话，第一轮可以计算出来
@@ -314,19 +320,24 @@ class MyGptForCausalLLM(PreTrainedModel, GenerationMixin):
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
             # 除了第一步外，每一步之处理一个token，因为第一步的past_len是0
             # 这里的言外之意是只计算kvchache中不包含的输入
-            outputs = self.forward(input_ids[:, past_len:], past_key_values, use_cache, attention_mask)
+            outputs = self.forward(
+                input_ids[:, past_len:],
+                past_key_values,
+                use_cache,
+                attention_mask
+            )
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             # batch, vocab_size
-            # 这里在索引中使用常数会杀掉维度，这似乎是会让维度消失的唯一方式
             logits = outputs.logits[:, -1, :] / temperature
             if repetition_penalty != 1.0:
-                for i in range(input_ids.shape(0)):
+                for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i])
                     score = logits[i, seen]
                     logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
-            
+
             if top_k > 0:
-                logits[logits < torch.topk(logits, top_k)[0][..., -1].unsqueeze(-1)] = -float('-inf')
+                # 只保留 top_k 的 logit，其余置为 -inf
+                logits[logits < torch.topk(logits, top_k)[0][..., -1].unsqueeze(-1)] = float("-inf")
 
             if top_p > 0:
                 # batch, vocab_size
@@ -335,10 +346,9 @@ class MyGptForCausalLLM(PreTrainedModel, GenerationMixin):
                 # 这个地方需要向右平移一位，确保切好覆盖到大于p的元素
                 # mask[..., :-1] 只是一个视图（view），它和 mask 共享底层存储
                 # 当 PyTorch 把视图的内容逐元素拷贝到 mask[..., 1:] 时，因为两段内存重叠：
-                mask[..., 1:], mast[..., 0] = mask[..., :-1].clone(), 0
+                mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
                 # 这里的1是维度，mask是要填入的数值
-                # 所以mask.scatter就是按照索引排布好的true和false
-                logits[mask.scatter(1, sorted_indices, mask)] = float("-inf")
+                # 所以mask.scatter就是按照索引排布好的true和false                logits[mask.scatter(1, sorted_indices, mask)] = float("-inf")
 
             next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
 
@@ -346,16 +356,16 @@ class MyGptForCausalLLM(PreTrainedModel, GenerationMixin):
                 next_token = torch.where(finished.unsqueeze(1), next_token.new_full((input_ids.shape[0], 1), eos_token_id), next_token)
 
             input_ids = torch.cat([input_ids, next_token], dim = -1)
-            past_key_values = output.past_key_values if use_cache else None
+            past_key_values = outputs.past_key_values if use_cache else None
             if streamer:
                 streamer.put(next_token.cpu())
             if eos_token_id is not None:
-                finished |= next_token.squeeze(-1), eq(eos_token_id)
+                finished |= (next_token.squeeze(-1) == eos_token_id)
                 if finished.all():
                     break
         if streamer:
             streamer.end()
-        
+
         if kwargs.get("return_kv"):
             return {"generated_ids" : input_ids, "past_kv" : past_key_values}
 
