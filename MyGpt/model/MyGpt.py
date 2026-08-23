@@ -137,6 +137,7 @@ class GroupQueryAttention(nn.Module):
         xv = self.repeat(xv).transpose(1, 2)
         if self.flash and (seq > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.drop_out if self.training else 0.0, is_causal=self.is_causal)
+            output = output.transpose(1, 2).contiguous().view(batch, seq, -1)
         else:
             # batch, head_num, seq, past_len + seq
             attention_weight = (xq @ xk.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -152,8 +153,13 @@ class GroupQueryAttention(nn.Module):
                 pad_mask = (1 - attention_mask).unsqueeze(1).unsqueeze(1)
                 full_mask = torch.zeros(batch, 1, 1, kv_seq_len, device=attention_weight.device, dtype=attention_weight.dtype)
                 full_mask[..., kv_seq_len - seq:] = pad_mask
-                attention_weight = attention_weight + full_mask * float('-inf')
+                # 不能用 full_mask * -inf：0 * -inf = NaN，未遮盖位置会被污染
+                # 先只把 1（遮盖位）变成 -inf，0 位置保持 0，相加后不受影响
+                attention_weight = attention_weight + full_mask.masked_fill(full_mask != 0, float('-inf'))
             # batch, head_num, seq, head_dim
+            # 注意：attention_weight 是原始 score，必须先 softmax 归一化再乘 v
+            # （flash 路径的 SDPA 内部自带 softmax，这里必须手动补上）
+            attention_weight = F.softmax(attention_weight, dim=-1)
             output = (self.attn_dropout(attention_weight) @ xv).transpose(1, 2).contiguous().view(batch, seq, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
@@ -237,9 +243,9 @@ class LLMBlock(nn.Module):
             use_cache,
             attention_mask
         )
-        x += residual
+        x = x + residual
 
-        x += self.feedForward(self.pre_forward_layernorm(x))
+        x = x + self.feedForward(self.pre_forward_layernorm(x))
 
         return x, presnt_key_value
 
@@ -290,7 +296,7 @@ class MyGptForCausalLLM(PreTrainedModel, GenerationMixin):
         super().__init__(self.config)
         self.model = MyGpt(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size)
-        if self.tie_word_embeddings:
+        if self.config.tie_word_embeddings:
             self.model.embedding.weight = self.lm_head.weight
         self.post_init()
         

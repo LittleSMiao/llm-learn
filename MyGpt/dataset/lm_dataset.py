@@ -34,7 +34,7 @@ def prob_remove_empty_think(prompt, prob=0.8):
         prompt = prompt.replace(empty_pattern, "")
     return prompt
 
-def SFTDataSet(Dataset):
+class SFTDataSet(Dataset):
     def __init__(self, max_length, tokenizer, json_file):
         super().__init__()
         self.max_length = max_length
@@ -53,9 +53,9 @@ def SFTDataSet(Dataset):
         for message in conversations:
             message = dict(message)
             if message.get("role") == "system" and message.get("tools") is not None:
-                tools = json.load(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
-            else if message.get("tool_calls") and isinstance(message["tool_calls"], str):
-                message = json.load(message["tool_calls"])
+                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            elif message.get("tool_calls") and isinstance(message["tool_calls"], str):
+                message = json.loads(message["tool_calls"])
             messages.append(message)
         return self.tokenizer.apply_chat_template(
             messages,
@@ -69,12 +69,12 @@ def SFTDataSet(Dataset):
         index = 0
 
         while index < len(prompt_ids):
-            if prompt_ids[index : index + len(bos_id)] == bos_id:
-                start_pos = index + len(bos_id)
-                index = start_pos:
-                while prompt[index : index + len(eos_id)] != eos_id and index < len(prompt_ids):
+            if prompt_ids[index : index + len(self.bos_id)] == self.bos_id:
+                start_pos = index + len(self.bos_id)
+                index = start_pos
+                while prompt_ids[index : index + len(self.eos_id)] != self.eos_id and index < len(prompt_ids):
                     index += 1
-                end_pos = index + len(eos_id) if index + len(eos_id) < len(prompt_ids) else len(prompt_ids)
+                end_pos = index + len(self.eos_id) if index + len(self.eos_id) < len(prompt_ids) else len(prompt_ids)
                 for fill_index in range(start_pos, end_pos):
                     masked_prompt[fill_index] = prompt_ids[fill_index]
                 index = end_pos
@@ -85,7 +85,7 @@ def SFTDataSet(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        prompt = get_fully_conversation_string(sample["conversations"])
+        prompt = self.get_fully_conversation_string(sample["conversations"])
         prompt = prob_remove_empty_think(prompt)
         prompt_ids = self.tokenizer(prompt).input_ids[:self.max_length]
         prompt_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(prompt_ids))
