@@ -5,7 +5,7 @@ import warnings
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.MyGpt import MyGptConfig, MyGptForCausalLLM
-from mode.lora import *
+from model.lora import *
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
@@ -21,8 +21,8 @@ def init_model(args):
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
-        if args.lora_weight != None:
-            apply_lora(model)
+        if args.lora_weight != 'None':
+            apply_lora_to_model(model)
             load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}.pth')
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
