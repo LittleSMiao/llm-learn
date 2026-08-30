@@ -15,8 +15,8 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.MyGpt import MyGptConfig
-from dataset.lm_dataset import SFTDataset
-from model.model_lora import save_lora, apply_lora
+from dataset.lm_dataset import SFTDataSet
+from model.lora import save_lora, apply_lora_to_model
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
@@ -126,7 +126,7 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    apply_lora(model)
+    apply_lora_to_model(model)
     
     # 统计参数
     total_params = sum(p.numel() for p in model.parameters())
@@ -145,7 +145,7 @@ if __name__ == "__main__":
             param.requires_grad = False
     
     # ========== 6. 定义数据和优化器 ==========
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_ds = SFTDataSet(args.max_seq_len, tokenizer, args.data_path)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
