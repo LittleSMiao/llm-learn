@@ -49,7 +49,8 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
 
     # 提升尽可能的大
     logits = policy_logratio - ref_logratio
-    return loss = -F.logsigmoid(beta * logits).mean()
+    loss = -F.logsigmoid(beta * logits).mean()
+    return loss
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
     start_time = time.time()

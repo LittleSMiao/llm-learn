@@ -93,13 +93,12 @@ class SFTDataSet(Dataset):
         return torch.tensor(prompt_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 
-def DPODtaSet(Dataset):
+class DPODtaSet(Dataset):
     def __init__(self, max_length, tokenizer, json_file):
         super().__init__()
         self.max_length = max_length
         self.tokenizer = tokenizer
-        features = Features({'conversations': [{'role': Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'), 'tools': Value('string'), 'tool_calls': Value('string')}]})
-        self.samples = load_dataset('json', data_files=json_file, split='train', features=features)
+        self.samples = load_dataset('json', data_files=json_file, split='train')
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
@@ -115,7 +114,7 @@ def DPODtaSet(Dataset):
             chosen,
             tokenize=False,
             add_generation_prompt=False,
-            tools=tools
+            tools=None
         )
 
         chosen = prob_remove_empty_think(chosen)
@@ -124,7 +123,7 @@ def DPODtaSet(Dataset):
             rejected,
             tokenize=False,
             add_generation_prompt=False,
-            tools=tools
+            tools=None
         )
         rejected = prob_remove_empty_think(rejected)
 
@@ -136,16 +135,16 @@ def DPODtaSet(Dataset):
         )
 
         chosen_ids = chosen_encoding["input_ids"]
-        chosen_mask = get_prompt_mask(self, chosen_ids)
+        chosen_mask = self.get_prompt_mask(chosen_ids)
         rejected_ids = rejected_encoding["input_ids"]
-        rejected_mask = get_prompt_mask(self, rejected_ids)
+        rejected_mask = self.get_prompt_mask(rejected_ids)
 
         x_chosen = torch.tensor(chosen_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_ids[1:], dtype=torch.long)
         chosen_mask = torch.tensor(chosen_mask[1:], dtype=torch.long)
 
         x_rejected = torch.tensor(rejected_ids[:-1], dtype=torch.long)
-        y_rejected = torch.tensor(rejected_ids[:-1], dtype=torch.long)
+        y_rejected = torch.tensor(rejected_ids[1:], dtype=torch.long)
         rejected_mask = torch.tensor(rejected_mask[1:], dtype=torch.long)
 
         return {
