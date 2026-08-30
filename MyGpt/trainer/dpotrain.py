@@ -15,7 +15,7 @@ from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from model.model_minimind import MiniMindConfig
+from model.MyGpt import MyGptConfig
 from dataset.lm_dataset import DPODtaSet
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -49,7 +49,8 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
 
     # 提升尽可能的大
     logits = policy_logratio - ref_logratio
-    return loss = -F.logsigmoid(beta * logits).mean()
+    loss = -F.logsigmoid(beta * logits).mean()
+    return loss
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
     start_time = time.time()
@@ -164,7 +165,7 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    lm_config = MyGptConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
