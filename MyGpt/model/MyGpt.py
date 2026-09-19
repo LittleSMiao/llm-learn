@@ -145,6 +145,7 @@ class GroupQueryAttention(nn.Module):
             if self.is_causal:
                 # 因果 mask 只作用于右侧新 token 的 key 列，左侧 past 列是历史 key，全部可见
                 causal_mask = torch.zeros(seq, kv_seq_len, device=attention_weight.device, dtype=attention_weight.dtype)
+                # triu 为 1 表示向上平移一格，即对角线上的元素也为0
                 causal_mask[:, kv_seq_len - seq:] = torch.full((seq, seq), float("-inf"), device=attention_weight.device, dtype=attention_weight.dtype).triu(1)
                 attention_weight = attention_weight + causal_mask.unsqueeze(0).unsqueeze(0)
             # 这里的 attention mask 维度是 batch * seq，是上层应用传入表示哪些有效，所以我们需要把 score 中无效的 token 设置为 -inf
